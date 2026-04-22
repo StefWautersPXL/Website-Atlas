@@ -1,12 +1,12 @@
 #!/bin/bash
 
-# Controleer of het script als root wordt uitgevoerd
+# controle uitvoeren script via root        
 if [ "$EUID" -ne 0 ]; then
     echo "Voer dit script uit als root (sudo)"
     exit 1
 fi
 
-# Detecteer pakketbeheerder en update
+# Alle bekende pakketbeheerders afgaan om te updaten
 if command -v apt &> /dev/null; then
     echo "==> Debian/Ubuntu gedetecteerd (apt)"
     apt update && apt upgrade -y
