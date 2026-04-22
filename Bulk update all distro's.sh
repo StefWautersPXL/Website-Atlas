@@ -32,7 +32,7 @@ elif command -v apk &> /dev/null; then
     apk update && apk upgrade
 
 else
-    echo "Geen bekende pakketbeheerder gevonden!"
+    echo "Contacteer de IT dienst voor meer hulp"
     exit 1
 fi
 
