@@ -1,81 +1,97 @@
-# Script: Sync-DL_Entra_POC.ps1
-# Doel: bewaak lokale AD-groep DL_Entra_POC en forceer Entra Connect sync bij wijzigingen
+# Sync-DL_Entra_POC.ps1
+# Null-safe monitoring van lokale AD-groep en triggeren van Entra Connect delta sync
 
-Import-Module ActiveDirectory
-Import-Module ADSync
+Import-Module ActiveDirectory -ErrorAction Stop
+Import-Module ADSync -ErrorAction Stop
 
-# Naam van de lokale AD-groep
 $GroupName = "DL_Entra_POC"
+$ScriptFolder = "C:\Scripts"
+$StateFile = Join-Path $ScriptFolder "DL_Entra_POC_Members.txt"
+$LogFile = Join-Path $ScriptFolder "Sync-DL_Entra_POC.log"
+$SleepSeconds = 60
 
-# Pad naar bestand waarin we vorige ledenlijst bewaren
-$StateFile = "C:\Scripts\DL_Entra_POC_Members.txt"
-
-# Functie: haal huidige leden (samAccountName) van de groep op
-function Get-CurrentGroupMembers {
-    $members = Get-ADGroupMember -Identity $GroupName -Recursive -ErrorAction Stop |
-               Where-Object { $_.objectClass -eq "user" } |
-               ForEach-Object {
-                    (Get-ADUser $_.DistinguishedName -Properties samAccountName).samAccountName
-               }
-
-    # Sorteer voor consistente vergelijking
-    return $members | Sort-Object
+function Log {
+    param([string]$Message)
+    $time = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    "$time`t$Message" | Out-File -FilePath $LogFile -Append -Encoding UTF8
 }
 
-# Functie: laad vorige ledenlijst uit bestand (indien aanwezig)
+function Get-CurrentGroupMembers {
+    try {
+        $members = Get-ADGroupMember -Identity $GroupName -Recursive -ErrorAction Stop |
+                   Where-Object { $_.objectClass -eq "user" } |
+                   ForEach-Object {
+                       (Get-ADUser $_.DistinguishedName -Properties samAccountName -ErrorAction SilentlyContinue).samAccountName
+                   } | Where-Object { $_ }  # filter nulls
+        return ,@($members)  # force array
+    }
+    catch {
+        Log "ERROR: Kan huidige leden niet ophalen: $($_.Exception.Message)"
+        return @()
+    }
+}
+
 function Get-PreviousGroupMembers {
     if (Test-Path $StateFile) {
-        return Get-Content $StateFile | Sort-Object
+        try {
+            $content = Get-Content -Path $StateFile -ErrorAction Stop
+            return ,@($content | Where-Object { $_ })  # force array, filter lege regels
+        }
+        catch {
+            Log "WARNING: Kan state file niet lezen: $($_.Exception.Message)"
+            return @()
+        }
     }
     else {
         return @()
     }
 }
 
-# Functie: sla huidige ledenlijst op
-function Save-GroupMembers($members) {
-    $members | Sort-Object | Out-File -FilePath $StateFile -Encoding UTF8
+function Save-GroupMembers {
+    param([string[]]$Members)
+    try {
+        $Members | Sort-Object | Out-File -FilePath $StateFile -Encoding UTF8
+    }
+    catch {
+        Log "ERROR: Kan state file niet schrijven: $($_.Exception.Message)"
+    }
 }
 
-Write-Host "Start monitoring van groep '$GroupName' voor Entra sync..." -ForegroundColor Cyan
+Log "Script gestart. Monitoring van groep '$GroupName'."
 
 while ($true) {
     try {
-        # 1. Huidige en vorige leden ophalen
         $currentMembers  = Get-CurrentGroupMembers
         $previousMembers = Get-PreviousGroupMembers
 
-        # 2. Vergelijken
-        $added   = Compare-Object -ReferenceObject $previousMembers -DifferenceObject $currentMembers -PassThru | Where-Object { $_ -in $currentMembers }
-        $removed = Compare-Object -ReferenceObject $previousMembers -DifferenceObject $currentMembers -PassThru | Where-Object { $_ -in $previousMembers }
+        # Zorg dat variabelen nooit $null zijn
+        if (-not $currentMembers)  { $currentMembers = @() }
+        if (-not $previousMembers) { $previousMembers = @() }
 
-        if ($added -or $removed) {
-            Write-Host "Wijziging gedetecteerd in DL_Entra_POC!" -ForegroundColor Yellow
+        # Null-safe verschilberekening
+        $added   = $currentMembers | Where-Object { $_ -notin $previousMembers }
+        $removed = $previousMembers | Where-Object { $_ -notin $currentMembers }
 
-            if ($added) {
-                Write-Host "Toegevoegd:" $added -ForegroundColor Green
+        if ($added.Count -gt 0 -or $removed.Count -gt 0) {
+            Log "Wijziging gedetecteerd. Toegevoegd: $($added -join ', '); Verwijderd: $($removed -join ', ')"
+            Log "Start Entra Connect delta sync..."
+            try {
+                Start-ADSyncSyncCycle -PolicyType Delta -ErrorAction Stop
+                Log "Delta sync gestart."
             }
-            if ($removed) {
-                Write-Host "Verwijderd:" $removed -ForegroundColor Red
+            catch {
+                Log "ERROR: Kon delta sync niet starten: $($_.Exception.Message)"
             }
-
-            # 3. Delta sync naar Entra ID starten
-            Write-Host "Start Entra Connect delta sync..." -ForegroundColor Cyan
-            Start-ADSyncSyncCycle -PolicyType Delta
-
-            # 4. Nieuwe ledenlijst opslaan
-            Save-GroupMembers -members $currentMembers
-
-            Write-Host "Sync uitgevoerd op $(Get-Date)." -ForegroundColor Cyan
+            Save-GroupMembers -Members $currentMembers
         }
         else {
-            Write-Host "Geen wijzigingen in DL_Entra_POC. Laatste check: $(Get-Date)" -ForegroundColor DarkGray
+            Log "Geen wijzigingen. Laatste check: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
         }
     }
     catch {
-        Write-Host "Fout: $($_.Exception.Message)" -ForegroundColor Red
+        Log "FOUT in hoofdloop: $($_.Exception.Message)"
     }
 
-    # 5. Wacht X seconden/minuten voor volgende check
-    Start-Sleep -Seconds 60
+    Start-Sleep -Seconds $SleepSeconds
 }
+    
